@@ -4,21 +4,85 @@ import re
 import json
 from copy import copy
 
+try:
+    # py3
+    from queue import Empty
+
+    def isstr(s):
+        return isinstance(s, str)
+except ImportError:
+    # py2
+    from Queue import Empty
+
+    def isstr(s):
+        return isinstance(s, basestring)  # noqa
+
 from unittest import TestCase
 
 from nose.plugins import Plugin
 
-from IPython.nbformat import read
-from IPython.kernel.tests import utils
 
-__version__ = "0.2.0"
+try:
+    from ipykernel.tests import utils
+    from nbformat.converter import convert
+    from nbformat.reader import reads
+    IPYTHON_VERSION = 4
+except ImportError:
+    from IPython.kernel.tests import utils
+    try:
+        from IPython.nbformat.converter import convert
+        from IPython.nbformat.reader import reads
+        IPYTHON_VERSION = 3
+    except ImportError:
+        from IPython.nbformat.convert import convert
+        from IPython.nbformat.reader import reads
+        IPYTHON_VERSION = 2
 
 NBFORMAT_VERSION = 4
+
+__version__ = "0.4.0"
 
 log = logging.getLogger("nose.plugins.nosebook")
 
 
-class Nosebook(Plugin):
+class NosebookTwo(object):
+    """
+    Implement necessary functions against the IPython 2.x API
+    """
+
+    def newKernel(self, nb):
+        """
+        generate a new kernel
+        """
+        manager, kernel = utils.start_new_kernel()
+        return kernel
+
+
+class NosebookThree(object):
+    """
+    Implement necessary functions against the IPython 3.x API
+    """
+    def newKernel(self, nb):
+        """
+        generate a new kernel
+        """
+        manager, kernel = utils.start_new_kernel(
+            kernel_name=nb.metadata.kernelspec.name
+        )
+        return kernel
+
+
+if IPYTHON_VERSION == 2:
+    NosebookVersion = NosebookTwo
+else:
+    NosebookVersion = NosebookThree
+
+
+def dump_canonical(obj):
+    return json.dumps(obj, indent=2, sort_keys=True)
+
+
+class Nosebook(NosebookVersion, Plugin):
     """
     A nose plugin for discovering and executing IPython notebook cells
     as tests
@@ -33,6 +97,9 @@ class Nosebook(Plugin):
         self.testMatchPat = env.get('NOSEBOOK_TESTMATCH',
                                     r'.*[Tt]est.*\.ipynb$')
 
+        self.testMatchCellPat = env.get('NOSEBOOK_CELLMATCH',
+                                        r'.*')
+
         parser.add_option(
             "--nosebook-match",
             action="store",
@@ -43,6 +110,18 @@ class Nosebook(Plugin):
                  "Default: %s [NOSEBOOK_TESTMATCH]" % self.testMatchPat,
             default=self.testMatchPat
         )
+
+        parser.add_option(
+            "--nosebook-match-cell",
+            action="store",
+            dest="nosebookTestMatchCell",
+            metavar="REGEX",
+            help="Notebook cells that match this regular expression are "
+                 "considered tests.  "
+                 "Default: %s [NOSEBOOK_CELLMATCH]" % self.testMatchCellPat,
+            default=self.testMatchCellPat
+        )
+
         parser.add_option(
             "--nosebook-scrub",
             action="store",
@@ -59,7 +138,10 @@ class Nosebook(Plugin):
         apply configured options
         """
         super(Nosebook, self).configure(options, conf)
+
         self.testMatch = re.compile(options.nosebookTestMatch).match
+        self.testMatchCell = re.compile(options.nosebookTestMatchCell).match
+
         scrubs = []
         if options.nosebookScrub:
             try:
@@ -67,8 +149,10 @@ class Nosebook(Plugin):
             except Exception:
                 scrubs = [options.nosebookScrub]
 
-        if isinstance(scrubs, str):
-            scrubs = {scrubs: "<...>"}
+        if isstr(scrubs):
+            scrubs = {
+                scrubs: "<...>"
+            }
         elif not isinstance(scrubs, dict):
             scrubs = dict([
                 (scrub, "<...%s>" % i)
@@ -80,22 +164,61 @@ class Nosebook(Plugin):
             for scrub, sub in scrubs.items()
         }
 
+    def wantModule(self, *args, **kwargs):
+        """
+        we don't handle actual code modules!
+        """
+        return False
+
+    def _readnb(self, filename):
+        with open(filename) as f:
+            return reads(f.read())
+
+    def readnb(self, filename):
+        try:
+            nb = self._readnb(filename)
+        except Exception as err:
+            log.info("could not be parse as a notebook %s\n%s",
+                     filename,
+                     err)
+            return False
+
+        return convert(nb, NBFORMAT_VERSION)
+
+    def codeCells(self, nb):
+        for cell in nb.cells:
+            if cell.cell_type == "code":
+                yield cell
+
     def wantFile(self, filename):
         """
         filter files to those that match nosebook-match
         """
-        return self.testMatch(filename) is not None
+
+        log.info("considering %s", filename)
+
+        if self.testMatch(filename) is None:
+            return False
+
+        nb = self.readnb(filename)
+
+        for cell in self.codeCells(nb):
+            return True
+
+        log.info("no `code` cells in %s", filename)
+
+        return False
 
     def loadTestsFromFile(self, filename):
         """
         find all tests in a notebook.
         """
-        nb = read(filename, NBFORMAT_VERSION)
+        nb = self.readnb(filename)
 
         kernel = self.newKernel(nb)
 
-        for cell_idx, cell in enumerate(nb.cells):
-            if cell.cell_type == "code":
+        for cell_idx, cell in enumerate(self.codeCells(nb)):
+            if self.testMatchCell(cell.source) is not None:
                 yield NoseCellTestCase(
                     cell,
                     cell_idx,
@@ -104,22 +227,13 @@ class Nosebook(Plugin):
                     scrubs=self.scrubMatch
                 )
 
-    def newKernel(self, nb):
-        """
-        generate a new kernel
-        """
-        manager, kernel = utils.start_new_kernel(
-            kernel_name=nb.metadata.kernelspec.name
-        )
-        return kernel
-
 
 class NoseCellTestCase(TestCase):
     """
     A test case for a single cell.
     """
-    IGNORE_TYPES = ["execute_request", "execute_input", "status"]
-    STRIP_KEYS = ["execution_count", "traceback"]
+    IGNORE_TYPES = ["execute_request", "execute_input", "status", "pyin"]
+    STRIP_KEYS = ["execution_count", "traceback", "prompt_number", "source"]
 
     def __init__(self, cell, cell_idx, kernel, *args, **kwargs):
         """
@@ -141,23 +255,39 @@ class NoseCellTestCase(TestCase):
     def id(self):
         return "%s#%s" % (self.filename, self.cell_idx)
 
+    def cellCode(self):
+        if hasattr(self.cell, "source"):
+            return self.cell.source
+        return self.cell.input
+
     def runTest(self):
-        self.kernel.execute(self.cell.source)
+        self.kernel.execute(self.cellCode())
 
         outputs = []
         msg = None
 
         while self.shouldContinue(msg):
-            msg = self.iopub.get_msg(block=True, timeout=1)
+            try:
+                msg = self.iopub.get_msg(block=True, timeout=1)
+            except Empty:
+                continue
 
             if msg["msg_type"] not in self.IGNORE_TYPES:
-                outputs.append(self.transformMessage(msg))
+                output = self.transformMessage(
+                    msg,
+                    self.cell.outputs[len(outputs)]
+                )
+                outputs.append(output)
 
-        self.assertEqual(
-            list(self.scrubOutputs(outputs)),
-            list(self.scrubOutputs(self.cell.outputs)),
-            [outputs, self.cell.outputs]
-        )
+        scrub = lambda x: dump_canonical(list(self.scrubOutputs(x)))
+
+        scrubbed = scrub(outputs)
+        expected = scrub(self.cell.outputs)
+
+        self.assertEqual(scrubbed, expected, "\n{}\n\n{}".format(
+            scrubbed,
+            expected
+        ))
 
     def scrubOutputs(self, outputs):
         """
@@ -167,15 +297,21 @@ class NoseCellTestCase(TestCase):
             out = copy(output)
 
             for scrub, sub in self.scrubs.items():
-                def _scrubLines(obj, key):
-                    obj[key] = re.sub(scrub, sub, obj[key])
+                def _scrubLines(lines):
+                    if isstr(lines):
+                        return re.sub(scrub, sub, lines)
+                    else:
+                        return [re.sub(scrub, sub, line) for line in lines]
 
                 if "text" in out:
-                    _scrubLines(out, "text")
+                    out["text"] = _scrubLines(out["text"])
 
                 if "data" in out:
-                    for mime, data in out["data"].items():
-                        _scrubLines(out["data"], mime)
+                    if isinstance(out["data"], dict):
+                        for mime, data in out["data"].items():
+                            out["data"][mime] = _scrubLines(data)
+                    else:
+                        out["data"] = _scrubLines(out["data"])
             yield out
 
     def stripKeys(self, d):
@@ -194,16 +330,32 @@ class NoseCellTestCase(TestCase):
             self.stripKeys(output)
         return cell
 
-    def transformMessage(self, msg):
+    def transformMessage(self, msg, expected):
         """
         transform a message into something like the notebook
         """
+        SWAP_KEYS = {
+            "output_type": {
+                "pyout": "execute_result",
+                "pyerr": "error"
+            }
+        }
+
         output = {
             u"output_type": msg["msg_type"]
         }
         output.update(msg["content"])
 
-        return self.stripKeys(output)
+        output = self.stripKeys(output)
+        for key, swaps in SWAP_KEYS.items():
+            if key in output and output[key] in swaps:
+                output[key] = swaps[output[key]]
+
+        if "data" in output and "data" not in expected:
+            output["text"] = output["data"]
+            del output["data"]
+
+        return output
 
     def shouldContinue(self, msg):
         """
